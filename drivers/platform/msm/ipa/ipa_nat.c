@@ -1,4 +1,4 @@
-/* Copyright (c) 2012-2015, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2012-2016, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -24,6 +24,16 @@
 #define IPA_NAT_SYSTEM_MEMORY  0
 #define IPA_NAT_SHARED_MEMORY  1
 #define IPA_NAT_TEMP_MEM_SIZE 128
+
+enum nat_table_type {
+	IPA_NAT_BASE_TBL = 0,
+	IPA_NAT_EXPN_TBL = 1,
+	IPA_NAT_INDX_TBL = 2,
+	IPA_NAT_INDEX_EXPN_TBL = 3,
+};
+
+#define NAT_TABLE_ENTRY_SIZE_BYTE 32
+#define NAT_INTEX_TABLE_ENTRY_SIZE_BYTE 4
 
 static int ipa_nat_vma_fault_remap(
 	 struct vm_area_struct *vma, struct vm_fault *vmf)
@@ -550,9 +560,6 @@ bail:
  */
 int ipa_nat_dma_cmd(struct ipa_ioc_nat_dma_cmd *dma)
 {
-#define NUM_OF_DESC 2
-
-	struct ipa_register_write *reg_write_nop = NULL;
 	struct ipa_nat_dma *cmd = NULL;
 	struct ipa_desc *desc = NULL;
 	u16 size = 0, cnt = 0;
@@ -560,75 +567,112 @@ int ipa_nat_dma_cmd(struct ipa_ioc_nat_dma_cmd *dma)
 
 	IPADBG("\n");
 	if (dma->entries <= 0) {
-		IPAERR("Invalid number of commands %d\n",
-			dma->entries);
+		IPADBG("Invalid number of commands\n");
 		ret = -EPERM;
 		goto bail;
 	}
 
-	size = sizeof(struct ipa_desc) * NUM_OF_DESC;
+	for (cnt = 0; cnt < dma->entries; cnt++) {
+		if (dma->dma[cnt].table_index >= 1) {
+			IPAERR("Invalid table index %d\n",
+				dma->dma[cnt].table_index);
+			ret = -EPERM;
+			goto bail;
+		}
+
+		switch (dma->dma[cnt].base_addr) {
+		case IPA_NAT_BASE_TBL:
+			if (dma->dma[cnt].offset >=
+				(ipa_ctx->nat_mem.size_base_tables + 1) *
+				NAT_TABLE_ENTRY_SIZE_BYTE) {
+				IPAERR("Invalid offset %d\n",
+					dma->dma[cnt].offset);
+				ret = -EPERM;
+				goto bail;
+			}
+
+			break;
+
+		case IPA_NAT_EXPN_TBL:
+			if (dma->dma[cnt].offset >=
+				ipa_ctx->nat_mem.size_expansion_tables *
+				NAT_TABLE_ENTRY_SIZE_BYTE) {
+				IPAERR("Invalid offset %d\n",
+					dma->dma[cnt].offset);
+				ret = -EPERM;
+				goto bail;
+			}
+
+			break;
+
+		case IPA_NAT_INDX_TBL:
+			if (dma->dma[cnt].offset >=
+				(ipa_ctx->nat_mem.size_base_tables + 1) *
+				NAT_INTEX_TABLE_ENTRY_SIZE_BYTE) {
+				IPAERR("Invalid offset %d\n",
+					dma->dma[cnt].offset);
+				ret = -EPERM;
+				goto bail;
+			}
+
+			break;
+
+		case IPA_NAT_INDEX_EXPN_TBL:
+			if (dma->dma[cnt].offset >=
+				ipa_ctx->nat_mem.size_expansion_tables *
+				NAT_INTEX_TABLE_ENTRY_SIZE_BYTE) {
+				IPAERR("Invalid offset %d\n",
+					dma->dma[cnt].offset);
+				ret = -EPERM;
+				goto bail;
+			}
+
+			break;
+
+		default:
+			IPAERR("Invalid base_addr %d\n",
+				dma->dma[cnt].base_addr);
+			ret = -EPERM;
+			goto bail;
+		}
+	}
+	size = sizeof(struct ipa_desc) * dma->entries;
 	desc = kzalloc(size, GFP_KERNEL);
 	if (desc == NULL) {
 		IPAERR("Failed to alloc memory\n");
 		ret = -ENOMEM;
 		goto bail;
 	}
-
-	size = sizeof(struct ipa_nat_dma);
-	cmd = kzalloc(size, GFP_KERNEL);
+	size = sizeof(struct ipa_nat_dma) * dma->entries;
+	cmd = kmalloc(size, GFP_KERNEL);
 	if (cmd == NULL) {
 		IPAERR("Failed to alloc memory\n");
 		ret = -ENOMEM;
 		goto bail;
 	}
-
-	/* NO-OP IC for ensuring that IPA pipeline is empty */
-	reg_write_nop = kzalloc(sizeof(*reg_write_nop), GFP_KERNEL);
-	if (!reg_write_nop) {
-		IPAERR("Failed to alloc memory\n");
-		ret = -ENOMEM;
-		goto bail;
-	}
-
-	reg_write_nop->skip_pipeline_clear = 0;
-	reg_write_nop->value_mask = 0x0;
-
-	desc[0].type = IPA_IMM_CMD_DESC;
-	desc[0].opcode = IPA_REGISTER_WRITE;
-	desc[0].callback = NULL;
-	desc[0].user1 = NULL;
-	desc[0].user2 = 0;
-	desc[0].len = sizeof(*reg_write_nop);
-	desc[0].pyld = (void *)reg_write_nop;
-
 	for (cnt = 0; cnt < dma->entries; cnt++) {
-		cmd->table_index = dma->dma[cnt].table_index;
-		cmd->base_addr = dma->dma[cnt].base_addr;
-		cmd->offset = dma->dma[cnt].offset;
-		cmd->data = dma->dma[cnt].data;
+		cmd[cnt].table_index = dma->dma[cnt].table_index;
+		cmd[cnt].base_addr = dma->dma[cnt].base_addr;
+		cmd[cnt].offset = dma->dma[cnt].offset;
+		cmd[cnt].data = dma->dma[cnt].data;
+		desc[cnt].type = IPA_IMM_CMD_DESC;
+		desc[cnt].opcode = IPA_NAT_DMA;
+		desc[cnt].callback = NULL;
+		desc[cnt].user1 = NULL;
 
-		desc[1].type = IPA_IMM_CMD_DESC;
-		desc[1].opcode = IPA_NAT_DMA;
-		desc[1].callback = NULL;
-		desc[1].user1 = NULL;
-		desc[1].user2 = 0;
-		desc[1].len = sizeof(struct ipa_nat_dma);
-		desc[1].pyld = (void *)cmd;
+		desc[cnt].user2 = 0;
 
-		ret = ipa_send_cmd(NUM_OF_DESC, desc);
+		desc[cnt].len = sizeof(struct ipa_nat_dma);
+		desc[cnt].pyld = (void *)&cmd[cnt];
+
+		ret = ipa_send_cmd(1, &desc[cnt]);
 		if (ret == -EPERM)
 			IPAERR("Fail to send immediate command %d\n", cnt);
 	}
 
 bail:
-	if (cmd != NULL)
-		kfree(cmd);
-
-	if (desc != NULL)
-		kfree(desc);
-
-	if (reg_write_nop != NULL)
-		kfree(reg_write_nop);
+	kfree(cmd);
+	kfree(desc);
 
 	return ret;
 }
